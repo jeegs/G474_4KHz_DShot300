@@ -12,6 +12,12 @@
  *   - GYRO_DT/FC_LOOP_TIME 을 main.h 의 FC_LOOP_DT 로 통일
  *   - CONFIG=0x00 주석 정정: DLPF 우회가 아니라 자이로 DLPF 250Hz / 8kHz ODR
  *
+ *  Revised: 2026-09-26 (Claude)
+ *   - 자이로 FIFO 읽기(IMU_USE_FIFO): 8kHz 샘플을 모두 받아 루프(4kHz)마다 평균 (보통 2개)
+ *   - 자이로 범위 +-500 -> +-1000dps (GYRO_FS_SEL / DPS, imu.h)
+ *   - 자이로 소프트웨어 LPF 100Hz -> 150Hz (지연 약 1.6ms -> 1.1ms). 하드웨어 DLPF 250Hz 는 유지
+ *   - CONFIG 레지스터를 명시적으로 기록 (기존엔 리셋 기본값 0x00 에 의존)
+ *
  *  Revised: 2026-09-24 22:30 (Claude)
  *   - double 연산(pow/sqrt/asin/sin/dmul) 전부 float 로 교체 (Cortex-M4F 는 float 만 HW 지원)
  *   - 가속도 각도는 4루프에 1번만 계산(가속도 출력이 1kHz)
@@ -31,15 +37,18 @@
 #define DEG2RAD_F        0.0174532925f
 #define ACCEL_ANGLE_DIV  4                   // 가속도 각도 계산 주기 (4kHz/4 = 1kHz)
 
-// 자이로 1차 LPF: α = 1 - exp(-2π·fc·dt).  fc=100Hz @4kHz -> 0.145
+// 자이로 1차 LPF: α = 1 - exp(-2π·fc·dt) @4kHz
+//   fc=100Hz -> 0.145 (지연 약 1.6ms),  fc=150Hz -> 0.21 (약 1.1ms),  fc=200Hz -> 0.27 (약 0.8ms)
+// 2026-09-26: 100Hz -> 150Hz. 비행 후 모터가 뜨겁거나 떨림 소리가 커지면 0.145 로 되돌릴 것.
 // (기존 0.02 는 fc≈12.9Hz 로 레이트 루프 지연이 과도했음. 2kHz 시절 0.1 = 33Hz)
-#define GYRO_LPF_ALPHA   0.145f
+#define GYRO_LPF_ALPHA   0.21f
 
 IMU accel;
 IMU gyro;
 RPY gyroAngle;
 RPY accelAngle;
 RPY gyroAngular;
+IMU_FIFO_DIAG imu_fifo;
 //Kalman_test:
 KalmanFilter kf_roll;
 KalmanFilter kf_pitch;
@@ -102,15 +111,35 @@ void imu_configure(void) {
 	dshot_delay_ms(10);
 	// DLPF_CFG=0 (FCHOICE_B=0): 자이로 DLPF 대역 250Hz(지연 ~0.97ms), 자이로 ODR 8kHz.
 	// (DLPF '우회'가 아님. 우회는 GYRO_CONFIG 의 FCHOICE_B 를 켜야 함: BW 3.6kHz, 지연 ~0.17ms)
+	// FIFO 사용 시 bit6 FIFO_MODE=1: 가득 차면 더 쓰지 않음(패킷 경계가 깨지지 않게) -> 넘치면 리셋
+	spi2_write(I2C_IF, 0x40); // I2C 인터페이스 끔 (SPI 전용)
 	dshot_delay_ms(10);
-	spi2_write(GYRO_CONFIG, 0x08); //±500dps
+	spi2_write(CONFIG, IMU_USE_FIFO ? 0x40 : 0x00);
+	dshot_delay_ms(10);
+	spi2_write(GYRO_CONFIG, GYRO_FS_SEL); // imu.h (현재 +-1000dps)
 	dshot_delay_ms(10);
 	spi2_write(ACCEL_CONFIG, 0x10); //±8g
 	dshot_delay_ms(10);
 	spi2_write(ACCEL_CONFIG2, 0x03);
 	dshot_delay_ms(10);
 	spi2_write(SMPLRT_DIV, 0x00);
+#if IMU_USE_FIFO
+	dshot_delay_ms(10);
+	imu_fifo_reset();
+#endif
 }
+
+#if IMU_USE_FIFO
+// FIFO 비우고 다시 시작 (가속도 + 자이로, 한 패킷 14바이트)
+void imu_fifo_reset(void) {
+	spi2_write(ICM_FIFO_EN, 0x00);
+	spi2_write(USER_CTRL, 0x04); // FIFO_RST (FIFO 끈 상태에서)
+	for (volatile int d = 0; d < 1000; d++) {
+	}
+	spi2_write(ICM_FIFO_EN, 0x18); // GYRO + ACCEL
+	spi2_write(USER_CTRL, 0x40);   // FIFO_EN
+}
+#endif
 
 void gyro_offset_calculate(void) {
 	gyro.x_offset = 0;
@@ -167,7 +196,46 @@ void imu_read(void) {
 
 	uint8_t imuData[14];
 
+#if IMU_USE_FIFO
+	// 1) FIFO 에 쌓인 바이트 수
+	uint8_t cnt[2];
+	spi2_ll_reads(FIFO_COUNTH, cnt, 2);
+	uint16_t count = ((uint16_t) (cnt[0] & 0x1F) << 8) | cnt[1]; // 상위 예약 비트 제거
+	uint16_t n = count / IMU_FIFO_PACKET;
+
+	if (count >= IMU_FIFO_SIZE || n > IMU_FIFO_MAX_READ) {
+		// 넘침(또는 오래 못 읽음): 비우고 이번엔 직전 값을 그대로 쓴다
+		imu_fifo_reset();
+		imu_fifo.overflow_count++;
+		return;
+	}
+	if (n == 0) {
+		imu_fifo.empty_count++; // 새 샘플 없음: 직전 값 유지
+		return;
+	}
+
+	// 2) n 개 패킷을 한 번에 읽는다 (FIFO_R_W 는 주소가 증가하지 않고 계속 꺼내진다)
+	uint8_t buf[IMU_FIFO_MAX_READ * IMU_FIFO_PACKET];
+	spi2_ll_reads(FIFO_R_W, buf, (uint8_t) (n * IMU_FIFO_PACKET));
+	imu_fifo.last_samples = (uint8_t) n;
+
+	// 3) 가속도/온도는 가장 최근 패킷, 자이로는 n 개 평균 -> 레지스터 읽기와 같은 14바이트 형식으로 만든다
+	uint8_t *last = &buf[(n - 1) * IMU_FIFO_PACKET];
+	for (int i = 0; i < 8; i++)
+		imuData[i] = last[i];
+	for (int axis = 0; axis < 3; axis++) {
+		int32_t sum = 0;
+		for (uint16_t k = 0; k < n; k++) {
+			uint8_t *p = &buf[k * IMU_FIFO_PACKET + 8 + axis * 2];
+			sum += (int16_t) (((uint16_t) p[0] << 8) | p[1]);
+		}
+		int16_t avg = (int16_t) (sum / (int32_t) n);
+		imuData[8 + axis * 2] = (uint8_t) ((uint16_t) avg >> 8);
+		imuData[9 + axis * 2] = (uint8_t) avg;
+	}
+#else
 	spi2_ll_reads(ACCEL_XOUT_H, imuData, 14);
+#endif
 
 	accel.y = ((int16_t) imuData[0] << 8) | imuData[1];
 	accel.x = ((int16_t) imuData[2] << 8) | imuData[3];
