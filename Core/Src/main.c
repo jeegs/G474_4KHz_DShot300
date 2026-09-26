@@ -392,6 +392,13 @@ int main(void)
 		//set FLIGHT MODE and ARMING -------------------------------------------------> 2)
 		FM = flightmode(rc);
 		ARMED = arming(rc);
+#if BARO_ENABLED
+		// 아밍되는 순간의 압력을 상대 고도 0m 로 잡는다 (텔레메트리 altitude 기준)
+		static uint8_t prev_armed = 0;
+		if (ARMED == 2 && prev_armed != 2)
+			baro_zero_altitude();
+		prev_armed = ARMED;
+#endif
 
 #if RC_DEBUG_PRINT
 		// 진단용(임시, 4Hz): USART2(2,000,000bps 8N1)로 RC 디코딩 상태 출력.

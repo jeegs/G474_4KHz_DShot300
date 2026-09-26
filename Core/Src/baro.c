@@ -18,6 +18,7 @@
  *     (기존엔 마지막 값이 그대로 멈춘 채 ready=true 로 남았음)
  *   - 연결 진단: SPI 속도/모드를 바꿔가며 CHIP ID 를 읽고, 안 되면 MISO 풀다운 시험과
  *     I2C1(0x76/0x77) 탐색까지 해서 baro_diag 에 남긴다. 통하는 SPI 설정이 있으면 그것을 사용.
+ *   - 상대 고도 baro.altitude [m] 추가. 기준점은 부팅 후 첫 준비 시점, 이후 아밍할 때마다 다시 잡는다.
  */
 
 #include "baro.h"
@@ -66,6 +67,21 @@ static bool baro_present = false;
 extern I2C_HandleTypeDef hi2c1;
 static uint32_t fresh_count = 0;   // 끊김 이후 연속으로 받은 정상 샘플 수 (워밍업 판정)
 static uint32_t stale_loops = 0;   // 마지막 정상 샘플 이후 지난 루프 수
+static float ground_hpa = 0.0f;    // 상대 고도 0m 기준 압력 [hPa]. 0 = 아직 없음
+
+// 압력 -> 기준점 대비 상대 고도 [m] (국제표준대기 식). 50Hz 로만 호출된다.
+static float baro_relative_altitude(float press_hpa) {
+	if (ground_hpa <= 0.0f)
+		return 0.0f;
+	return 44330.0f * (1.0f - powf(press_hpa / ground_hpa, 0.190295f));
+}
+
+void baro_zero_altitude(void) {
+	if (baro.ready) {
+		ground_hpa = baro.short_pressure;
+		baro.altitude = 0.0f;
+	}
+}
 
 // SPI LL 통신 함수 (MS5611과 동일)
 void spi_ll_open() {
@@ -390,7 +406,10 @@ float get_pressure(Sensor type) {
 				if (++fresh_count >= BARO_WARMUP_SAMPLES) {
 					fresh_count = BARO_WARMUP_SAMPLES;
 					baro.ready = true;
+					if (ground_hpa <= 0.0f)
+						ground_hpa = press_hpa; // 첫 기준점 (아밍할 때 다시 잡는다)
 				}
+				baro.altitude = baro_relative_altitude(press_hpa);
 			} else {
 				baro_diag.reject_count++;
 			}

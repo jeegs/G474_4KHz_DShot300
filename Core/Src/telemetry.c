@@ -8,10 +8,14 @@
  *   - u3_rx_flag volatile, 하드코딩 더미 패킷 -> 실제 값, 에러 비트 실제 상태 반영
  *   - etc1/etc2 = 루프 사용 클럭 / 오버런 횟수 (진단용)
  *   - waypoint 배열 범위 초과 방지
+ *
+ *  Revised: 2026-09-26 (Claude)
+ *   - altitude = BMP390 기압으로 계산한 상대 고도 [m] (아밍 지점 기준, 음수는 0, 기압계 미준비 시 0)
  */
 
 #include "telemetry.h"
 #include "error.h"
+#include "baro.h"
 
 //Local ---------------------> start:
 extern uint16_t used_clocks;  // main.c (TIM7 0.25us 단위, 1000 초과 = 오버런)
@@ -71,6 +75,13 @@ void telemetry(void) {
 	// 진단용(etc): 루프 사용 클럭, 오버런 횟수
 	tm_tx.etc1 = used_clocks;
 	tm_tx.etc2 = (uint16_t) loop_overrun;
+
+	// 상대 고도 [m], 반올림. uint16 이라 기준점보다 낮으면(음수) 0 으로 보낸다.
+	tm_tx.altitude = 0;
+	if (baro.ready && baro.altitude > 0.0f) {
+		float a = baro.altitude + 0.5f;
+		tm_tx.altitude = (a > 65535.0f) ? 65535 : (uint16_t) a;
+	}
 
 	tm_tx.waypointNum = waypoint_size();
 
