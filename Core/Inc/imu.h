@@ -47,7 +47,13 @@ typedef struct {
 	uint8_t last_samples;   // 직전 읽기에서 평균한 샘플 수. 비행 루프에서는 대부분 2
 	uint32_t empty_count;   // 읽을 샘플이 없던 횟수 (가끔은 정상, 계속 늘면 FIFO 가 안 차는 것)
 	uint32_t overflow_count;// FIFO 가 넘쳐 리셋한 횟수 (부팅 직후 외에는 0 이어야 정상)
+	uint32_t fallback_count;// FIFO 가 연속으로 비어 레지스터 직접 읽기로 대신한 횟수 (0 이어야 정상)
+	uint8_t count_h, count_l; // 마지막으로 읽은 FIFO_COUNTH/L 원시값
+	// 설정 직후 되읽기 (정상값): CONFIG 0x40, GYRO_CONFIG 0x10, FIFO_EN 0x18, USER_CTRL 0x40,
+	//                            PWR_MGMT_1 0x01, I2C_IF 0x40, WHO_AM_I 0x12
+	uint8_t rb_config, rb_gyro_config, rb_fifo_en, rb_user_ctrl, rb_pwr_mgmt_1, rb_i2c_if, rb_whoami;
 } IMU_FIFO_DIAG;
+#define IMU_FIFO_EMPTY_FALLBACK 8 // 연속으로 이만큼(2ms) 비어 있으면 레지스터를 직접 읽는다
 extern IMU_FIFO_DIAG imu_fifo;
 
 typedef struct {

@@ -49,6 +49,7 @@ RPY gyroAngle;
 RPY accelAngle;
 RPY gyroAngular;
 IMU_FIFO_DIAG imu_fifo;
+static void imu_readback(void);
 //Kalman_test:
 KalmanFilter kf_roll;
 KalmanFilter kf_pitch;
@@ -127,6 +128,8 @@ void imu_configure(void) {
 	dshot_delay_ms(10);
 	imu_fifo_reset();
 #endif
+	dshot_delay_ms(1);
+	imu_readback();
 }
 
 #if IMU_USE_FIFO
@@ -140,6 +143,17 @@ void imu_fifo_reset(void) {
 	spi2_write(USER_CTRL, 0x40);   // FIFO_EN
 }
 #endif
+
+// 설정이 실제로 들어갔는지 되읽기 (imu_fifo.rb_*)
+static void imu_readback(void) {
+	imu_fifo.rb_config = spi2_ll_read(CONFIG);
+	imu_fifo.rb_gyro_config = spi2_ll_read(GYRO_CONFIG);
+	imu_fifo.rb_fifo_en = spi2_ll_read(ICM_FIFO_EN);
+	imu_fifo.rb_user_ctrl = spi2_ll_read(USER_CTRL);
+	imu_fifo.rb_pwr_mgmt_1 = spi2_ll_read(PWR_MGMT_1);
+	imu_fifo.rb_i2c_if = spi2_ll_read(I2C_IF);
+	imu_fifo.rb_whoami = spi2_ll_read(WHO_AM_I);
+}
 
 void gyro_offset_calculate(void) {
 	gyro.x_offset = 0;
@@ -198,8 +212,11 @@ void imu_read(void) {
 
 #if IMU_USE_FIFO
 	// 1) FIFO 에 쌓인 바이트 수
+	static uint8_t empty_run = 0;
 	uint8_t cnt[2];
 	spi2_ll_reads(FIFO_COUNTH, cnt, 2);
+	imu_fifo.count_h = cnt[0];
+	imu_fifo.count_l = cnt[1];
 	uint16_t count = ((uint16_t) (cnt[0] & 0x1F) << 8) | cnt[1]; // 상위 예약 비트 제거
 	uint16_t n = count / IMU_FIFO_PACKET;
 
@@ -210,9 +227,17 @@ void imu_read(void) {
 		return;
 	}
 	if (n == 0) {
-		imu_fifo.empty_count++; // 새 샘플 없음: 직전 값 유지
-		return;
+		imu_fifo.empty_count++;
+		if (++empty_run < IMU_FIFO_EMPTY_FALLBACK)
+			return; // 잠깐 빈 것: 직전 값 유지
+		// 계속 비어 있음 = FIFO 가 동작하지 않음 -> 자이로가 멈추지 않도록 레지스터를 직접 읽는다
+		empty_run = IMU_FIFO_EMPTY_FALLBACK;
+		imu_fifo.fallback_count++;
+		imu_fifo.last_samples = 0;
+		spi2_ll_reads(ACCEL_XOUT_H, imuData, 14);
+		goto parse;
 	}
+	empty_run = 0;
 
 	// 2) n 개 패킷을 한 번에 읽는다 (FIFO_R_W 는 주소가 증가하지 않고 계속 꺼내진다)
 	uint8_t buf[IMU_FIFO_MAX_READ * IMU_FIFO_PACKET];
@@ -233,6 +258,7 @@ void imu_read(void) {
 		imuData[8 + axis * 2] = (uint8_t) ((uint16_t) avg >> 8);
 		imuData[9 + axis * 2] = (uint8_t) avg;
 	}
+parse:
 #else
 	spi2_ll_reads(ACCEL_XOUT_H, imuData, 14);
 #endif
