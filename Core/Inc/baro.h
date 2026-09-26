@@ -21,6 +21,7 @@ typedef struct {
 	float press_compensated; // 고도 제어에 쓰는 압력 [hPa]
 	bool ready;              // 칩 확인 + 워밍업 완료 시 true
 	uint32_t sample_count;   // 새 샘플이 들어올 때마다 +1 (50Hz)
+	float altitude;          // 기준점(아밍 시점, 아밍 전엔 부팅 후 첫 준비 시점) 대비 상대 고도 [m]
 } BARO;
 extern BARO baro;
 
@@ -53,6 +54,7 @@ extern BARO_DIAG baro_diag;
 extern float brake_throttle; // 압력 변화율 [Pa/s] (0.2s 창) - 고도 PID 의 D 입력
 
 void baro_init(Sensor type);
+void baro_zero_altitude(void); // 현재 압력을 고도 0m 기준으로 잡는다 (아밍 시 호출)
 float get_pressure(Sensor type);
 
 #endif /* INC_BARO_H_ */

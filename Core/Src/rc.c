@@ -101,6 +101,14 @@
  *     -> 사용자 결정(2026-09-25): 지금 구조를 그대로 유지하고, 이 드론/
  *        페일세이프는 저고도(실내/마당 등) 테스트 용도로만 사용하기로 함.
  *        고고도 비행 계획이 생기면 이 부분을 반드시 먼저 재설계할 것.
+ *
+ *  Revised: 2026-09-26 (Claude)
+ *   - 페일세이프 조합("롤/피치/요 중앙 + 스로틀 최저")은 바닥 대기 자세와 똑같아서
+ *     (1) 디스암 대기 중 0.4s 뒤 error.RC 가 켜져 텔레메트리에 RC 에러(16)가 상시 표시되고
+ *     (2) 아밍 후 스틱을 놓고 있으면 약 1s 만에 페일세이프가 걸려 저절로 디스암되었음.
+ *     -> 아밍 후 스로틀이 한 번이라도 RC_FS_AIRBORNE_THROTTLE(1200)을 넘은 뒤(rc_airborne)에만
+ *        조합 판정을 쓴다. 디스암하면 해제. 수신기 프레임 끊김(타임아웃) 판정은 항상 동작.
+ *     NOTE: 착륙 후 아밍 상태로 스틱을 놓아 두면 여전히 페일세이프로 판단돼 약 1s 뒤 디스암된다.
  */
 
 #include "rc.h"
@@ -142,10 +150,14 @@ volatile uint8_t uart4_rx_cnt;
 #define RC_FS_CH4          1500  // 요 중앙
 #define RC_FS_TOL          15    // 허용 오차 (us)
 #define RC_FS_MATCH_HOLD_MS 400  // 이 조합이 이 시간 이상 유지되면 링크 두절로 판단
+// 위 조합은 "디스암/아밍 직후 바닥에서 스틱을 놓고 대기하는 자세"와 똑같다.
+// 그래서 아밍 후 스로틀이 한 번이라도 이 값을 넘어 "이륙한" 뒤에만 조합 판정을 쓴다.
+#define RC_FS_AIRBORNE_THROTTLE 1200
                                  // (조종 중 잠깐 스치는 것과 구분하기 위한 디바운스)
 static uint32_t rc_last_valid_ms;
 static bool rc_ever_valid = false;
 static float last_good_throttle = 1500.0f; // 페일세이프 패턴이 아닐 때의 마지막 스로틀(us)
+static bool rc_airborne = false; // 아밍 후 스로틀이 RC_FS_AIRBORNE_THROTTLE 을 넘은 적 있음 (디스암 시 해제)
 
 RC channel;
 ERRORS error;
@@ -297,7 +309,8 @@ bool rc_link_lost(void) {
 	// RC_FS_MATCH_HOLD_MS 이상 계속 유지되면 링크 두절로 판단한다.
 	static uint32_t match_start_ms = 0;
 	static bool matching = false;
-	if (rc_matches_failsafe_pattern()) {
+	// 이륙 전(디스암 대기, 아밍 직후 바닥)에는 조합 판정을 하지 않는다: 대기 자세와 구분 불가
+	if (rc_airborne && rc_matches_failsafe_pattern()) {
 		if (!matching) {
 			matching = true;
 			match_start_ms = HAL_GetTick();
@@ -323,6 +336,12 @@ RC rc_failsafe(RC r) {
 	static float fs_throttle = 0.0f;
 	static float fs_peak = 0.0f;
 
+	// 이륙 여부 갱신: 아밍 후 스로틀을 한 번이라도 올렸으면 이륙한 것으로 본다.
+	if (ARMED != 2)
+		rc_airborne = false;
+	else if (r.ch3 > RC_FS_AIRBORNE_THROTTLE)
+		rc_airborne = true;
+
 	// rc_link_lost()는 내부적으로 last_good_throttle 등 상태를 갱신하므로
 	// 매 루프 반드시 호출한다. "확정된"(디바운스 통과) 링크 두절 여부.
 	bool lost = rc_link_lost();
@@ -331,7 +350,7 @@ RC rc_failsafe(RC r) {
 	// 디바운스(RC_FS_MATCH_HOLD_MS)가 끝날 때까지 그 값을 그대로 모터에
 	// 흘려보내면 그 사이 모터가 일시적으로 죽어버린다. 그래서 패턴이 보이는
 	// 즉시(확정 여부와 무관하게) 아래 보호 로직을 먼저 가동한다.
-	bool pattern_now = rc_matches_failsafe_pattern();
+	bool pattern_now = rc_airborne && rc_matches_failsafe_pattern();
 
 	if (ARMED != 2 || (!pattern_now && !lost)) {
 		fs_active = false;
