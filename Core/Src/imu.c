@@ -134,13 +134,28 @@ void imu_configure(void) {
 
 #if IMU_USE_FIFO
 // FIFO 비우고 다시 시작 (가속도 + 자이로, 한 패킷 14바이트)
+// 기체 확인(2026-09-26): 리셋 직후 바로 FIFO_EN 을 쓰면 USER_CTRL 이 0x00 으로 남아 FIFO 가 꺼져 있었음.
+// -> 리셋 후 충분히 기다리고, FIFO_EN 을 쓴 뒤 되읽어서 들어갈 때까지 최대 5회 다시 쓴다.
+static void imu_short_delay(void) {
+	for (volatile int d = 0; d < 5000; d++) { // 약 0.1~0.3ms (최적화 수준에 따라 다름)
+	}
+}
+
 void imu_fifo_reset(void) {
 	spi2_write(ICM_FIFO_EN, 0x00);
-	spi2_write(USER_CTRL, 0x04); // FIFO_RST (FIFO 끈 상태에서)
-	for (volatile int d = 0; d < 1000; d++) {
-	}
+	spi2_write(USER_CTRL, 0x00);   // FIFO 끔
+	imu_short_delay();
+	spi2_write(USER_CTRL, 0x04);   // FIFO_RST (FIFO 끈 상태에서)
+	imu_short_delay();
 	spi2_write(ICM_FIFO_EN, 0x18); // GYRO + ACCEL
-	spi2_write(USER_CTRL, 0x40);   // FIFO_EN
+	imu_short_delay();
+	for (int retry = 0; retry < 5; retry++) {
+		spi2_write(USER_CTRL, 0x40); // FIFO_EN
+		imu_short_delay();
+		imu_fifo.rb_user_ctrl = spi2_ll_read(USER_CTRL);
+		if (imu_fifo.rb_user_ctrl & 0x40)
+			break;
+	}
 }
 #endif
 
@@ -149,7 +164,7 @@ static void imu_readback(void) {
 	imu_fifo.rb_config = spi2_ll_read(CONFIG);
 	imu_fifo.rb_gyro_config = spi2_ll_read(GYRO_CONFIG);
 	imu_fifo.rb_fifo_en = spi2_ll_read(ICM_FIFO_EN);
-	imu_fifo.rb_user_ctrl = spi2_ll_read(USER_CTRL);
+	imu_fifo.rb_user_ctrl = spi2_ll_read(USER_CTRL); // 0x40 이어야 FIFO 가 켜진 것
 	imu_fifo.rb_pwr_mgmt_1 = spi2_ll_read(PWR_MGMT_1);
 	imu_fifo.rb_i2c_if = spi2_ll_read(I2C_IF);
 	imu_fifo.rb_whoami = spi2_ll_read(WHO_AM_I);
