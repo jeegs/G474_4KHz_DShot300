@@ -16,6 +16,8 @@
  *   - 설정 후 ERR_REG/PWR_CTRL 을 확인해 설정이 실제로 먹지 않았으면 ready 를 올리지 않음
  *   - 비행 중 센서가 끊겨 새 샘플이 0.2s 이상 안 들어오면 ready=false -> error.BARO
  *     (기존엔 마지막 값이 그대로 멈춘 채 ready=true 로 남았음)
+ *   - 연결 진단: SPI 속도/모드를 바꿔가며 CHIP ID 를 읽고, 안 되면 MISO 풀다운 시험과
+ *     I2C1(0x76/0x77) 탐색까지 해서 baro_diag 에 남긴다. 통하는 SPI 설정이 있으면 그것을 사용.
  */
 
 #include "baro.h"
@@ -61,6 +63,7 @@ struct bmp3_calib_data {
 };
 static struct bmp3_calib_data calib;
 static bool baro_present = false;
+extern I2C_HandleTypeDef hi2c1;
 static uint32_t fresh_count = 0;   // 끊김 이후 연속으로 받은 정상 샘플 수 (워밍업 판정)
 static uint32_t stale_loops = 0;   // 마지막 정상 샘플 이후 지난 루프 수
 
@@ -145,12 +148,92 @@ void bmp3_get_calib_data(void) {
 	calib.par_p11 = (double) nvm_p11 / 36893488147419103232.0; // / 2^65
 }
 
+// SPI1 속도/모드 변경 (SPI 를 끈 상태에서만 바꿀 수 있음)
+static void spi1_set(uint32_t prescaler, uint32_t polarity, uint32_t phase) {
+	while (LL_SPI_IsActiveFlag_BSY(SPI1)) {
+	}
+	LL_SPI_Disable(SPI1);
+	LL_SPI_SetBaudRatePrescaler(SPI1, prescaler);
+	LL_SPI_SetClockPolarity(SPI1, polarity);
+	LL_SPI_SetClockPhase(SPI1, phase);
+	LL_SPI_Enable(SPI1);
+}
+
+// 현재 SPI 설정으로 CHIP ID 읽기 (첫 읽기는 더미: CS 하강 에지로 센서를 SPI 모드로 전환)
+static uint8_t spi_probe_id(void) {
+	bmp3_read_reg(BMP3_CHIP_ID_ADDR);
+	LL_mDelay(1);
+	return bmp3_read_reg(BMP3_CHIP_ID_ADDR);
+}
+
+// 속도를 낮춰가며 SPI 로 CHIP ID 를 읽는다. 처음으로 0x60 이 나온 설정을 유지하고 true.
+static bool baro_find_spi(void) {
+	static const struct {
+		uint32_t presc, pol, pha;
+	} cfg[5] = {
+		{ LL_SPI_BAUDRATEPRESCALER_DIV16,  LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 10MHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV32,  LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 5MHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV64,  LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 2.5MHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV256, LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 625kHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV256, LL_SPI_POLARITY_HIGH, LL_SPI_PHASE_2EDGE }, // 625kHz mode3
+	};
+
+	// SCK/MOSI 에지를 조금 더 가파르게 (생성 코드는 LOW 속도: 10MHz 에서 여유 적음)
+	LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_5, LL_GPIO_SPEED_FREQ_MEDIUM);
+	LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_7, LL_GPIO_SPEED_FREQ_MEDIUM);
+
+	baro_diag.probe_ok = 0xFF;
+	for (uint8_t i = 0; i < 5; i++) {
+		spi1_set(cfg[i].presc, cfg[i].pol, cfg[i].pha);
+		baro_diag.probe_id[i] = spi_probe_id();
+		if (baro_diag.probe_id[i] == BMP3_CHIP_ID) {
+			baro_diag.probe_ok = i;
+			return true;
+		}
+	}
+	// 전부 실패: 원래 설정(10MHz mode0)으로 되돌림
+	spi1_set(cfg[0].presc, cfg[0].pol, cfg[0].pha);
+	return false;
+}
+
+// SPI 가 전부 실패했을 때 원인 좁히기: MISO 풀다운 시험, I2C1 주소 탐색
+static void baro_probe_misc(void) {
+	// (a) MISO 에 내부 풀다운을 걸고 읽기. 떠 있는 선이면 0x00, 외부에서 HIGH 로 잡혀 있으면 0xFF.
+	LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_6, LL_GPIO_PULL_DOWN);
+	LL_mDelay(1);
+	spi_ll_open();
+	for (volatile int d = 0; d < 200; d++) {
+	}
+	baro_diag.miso_idle_pd = LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_6) ? 1 : 0;
+	spi_ll_close();
+	spi1_set(LL_SPI_BAUDRATEPRESCALER_DIV256, LL_SPI_POLARITY_LOW, LL_SPI_PHASE_1EDGE);
+	baro_diag.id_miso_pd = spi_probe_id();
+	spi1_set(LL_SPI_BAUDRATEPRESCALER_DIV16, LL_SPI_POLARITY_LOW, LL_SPI_PHASE_1EDGE);
+	LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_6, LL_GPIO_PULL_NO);
+
+	// (b) I2C1(PA15=SCL, PB9=SDA) 에 BMP390 이 붙어 있는지 확인 (주소 0x76: SDO=GND, 0x77: SDO=VCC)
+	uint8_t id = 0;
+	baro_diag.i2c_st_76 = (uint8_t) HAL_I2C_Mem_Read(&hi2c1, 0x76 << 1,
+			BMP3_CHIP_ID_ADDR, I2C_MEMADD_SIZE_8BIT, &id, 1, 5);
+	baro_diag.i2c_id_76 = (baro_diag.i2c_st_76 == HAL_OK) ? id : 0;
+	id = 0;
+	baro_diag.i2c_st_77 = (uint8_t) HAL_I2C_Mem_Read(&hi2c1, 0x77 << 1,
+			BMP3_CHIP_ID_ADDR, I2C_MEMADD_SIZE_8BIT, &id, 1, 5);
+	baro_diag.i2c_id_77 = (baro_diag.i2c_st_77 == HAL_OK) ? id : 0;
+}
+
 void baro_init(Sensor type) {
 	baro.ready = false;
 	baro.sample_count = 0;
 	baro_present = false;
 
 	spi_ll_close(); // CS HIGH
+
+	// 0. 통하는 SPI 설정 찾기 (배선/속도 문제 진단 겸용). 찾은 설정을 그대로 사용한다.
+	if (!baro_find_spi()) {
+		baro_probe_misc(); // SPI 전부 실패 -> MISO 풀다운 시험 + I2C 탐색 결과만 남기고 종료
+		return;
+	}
 
 	// 1. Soft Reset
 	bmp3_write_reg(BMP3_CMD_ADDR, 0xB6);
