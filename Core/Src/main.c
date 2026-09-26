@@ -66,8 +66,9 @@
 #define TWO_ARM_TEST_MODE 1
 // 1: BMP390L 사용(baro_init/get_pressure). 0 이면 error.BARO=true 로 FM2 이상 진입 불가.
 #define BARO_ENABLED      1
-// 1: 기압 고도 유지 사용 (BARO_ENABLED 필요). 고도 PID 게인은 Pa 단위로 재튜닝 필요.
-#define ALT_HOLD_ENABLED  0
+// 1: 기압 고도 유지 사용 (BARO_ENABLED 필요). ch5 > 1400 (FM2) 에서 동작.
+//    고도 PID 게인은 pid.c 의 ALT_KP/ALT_KI/ALT_KD [m 단위]. 튜닝 전에는 낮은 고도에서만 시험.
+#define ALT_HOLD_ENABLED  1
 // 1: 아밍 안 되는 문제 진단용 RC 디코딩 상태 출력(USART2, 2,000,000bps 8N1).
 // 2026-09-25 11:20: 진짜 원인(rc.c의 rc_ever_valid 미갱신 버그) 확인 및 수정
 // 완료로 0으로 되돌림. printf 는 매 호출 블로킹이라 상시 켜두면 안 됨.
@@ -160,7 +161,8 @@ uint16_t throttle_decision(Flight type, RC rc, float pressure, uint8_t fm) {
 	//Auto(+Manual):
 	if (fm >= 2) {
 #if ALT_HOLD_ENABLED
-		float t = alt_PID(ALT, &alt, pressure);
+		(void) pressure;
+		float t = alt_PID(ALT, &alt, baro.altitude); // [m]
 		if (t < 1000.0f)
 			t = 1000.0f; // 음수/저값이 uint16 으로 wrap 되는 것 방지
 		if (t > 1800.0f)

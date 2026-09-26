@@ -43,7 +43,8 @@ void gyro_pid_reset();
 void pid_gain_init(uint8_t type, float kp, float ki, float kd);
 void att_pid_init(void);
 
-float alt_PID(Which type, PID *pid, float pressure);
-int16_t alt_setpoint_change(PID *pid, uint16_t alt_hold_throt, float pressure);
+float alt_PID(Which type, PID *pid, float altitude);      // altitude = baro.altitude [m]
+int16_t alt_setpoint_change(PID *pid, uint16_t alt_hold_throt, float altitude);
+extern uint16_t alt_throttle_out; // 고도 유지 최종 스로틀 [us] (텔레메트리 튜닝용)
 
 #endif /* INC_PID_H_ */
