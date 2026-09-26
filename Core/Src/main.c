@@ -11,6 +11,10 @@
  *   - 전압 보상 배율 상한(ESC_VOLT_GAIN_MAX) 추가: 저전압에서 출력이 과도하게 증폭되던 문제
  *   - 모터 믹싱을 motor_mix() 한 곳으로 통합, 사용되지 않던 잘못된 스케일의
  *     motor_rotate() 제거 (1000~2000 스케일 값을 DShot 클램프에 그대로 넣던 함수)
+ *
+ * Revised: 2026-09-26 (Claude)
+ *   - 모터 아이들(MOTOR_IDLE_DSHOT): 아밍하면 모터가 천천히 돌고, 스로틀 최저에서도
+ *     PID 가 모터를 올리고 내릴 여유가 생긴다. (기존 48 = DShot 스로틀 0, 모터 정지)
  ******************************************************************************
  * @attention
  *
@@ -53,6 +57,9 @@
 
 // 전압 보상 배율 상한: 배터리 방전/순간 강하 시 max/V 가 커져 출력이 과증폭되는 것을 제한
 #define ESC_VOLT_GAIN_MAX 1.30f
+// 아밍 시 모터 최저 출력 (DShot 값, 48 = 0%, 2047 = 100%). 148 ≈ 5%.
+// 아밍했을 때 모터가 멈칫거리거나 서면 올리고, 너무 빠르면 내린다. 48 이면 기존과 같음(아이들 없음).
+#define MOTOR_IDLE_DSHOT  148
 
 // ---- 빌드 옵션 -------------------------------------------------------------
 // 1: 양팔 드론 테스트 모드 (롤만 제어, 피치/요 출력 0).  정상 4발 비행 시 0 으로.
@@ -228,11 +235,11 @@ void esc_restriction(uint16_t _min, uint16_t _max) {
 		esc4 = _min;
 }
 
-// 아이들(48) 위쪽 구간만 배율 보정 (아이들 자체는 올리지 않음)
+// 아이들 위쪽 구간만 배율 보정 (아이들 자체는 올리지 않음)
 static uint16_t esc_scale(uint16_t v, float gain) {
-	if (v <= 48)
+	if (v <= MOTOR_IDLE_DSHOT)
 		return v;
-	return (uint16_t) (48.0f + (float) (v - 48) * gain);
+	return (uint16_t) (MOTOR_IDLE_DSHOT + (float) (v - MOTOR_IDLE_DSHOT) * gain);
 }
 
 void esc_correction(Battery type) {
@@ -261,10 +268,13 @@ void esc_correction(Battery type) {
 	}
 }
 
-// 1000~2000(us) 스케일의 PID 출력으로 믹싱한 뒤 DShot(48~2047) 으로 선형 변환.
-// 스로틀/PID 모두 같은 비율(x1.999)로 커지므로 PID 게인은 기존 튜닝값 그대로 유효하다.
+// 1000~2000(us) 스케일의 PID 출력으로 믹싱한 뒤 DShot 으로 선형 변환.
+// 1000us -> MOTOR_IDLE_DSHOT(아이들). 기울기는 기존과 같은 x1.999 라서 PID 게인은 그대로 유효하다.
+// (위쪽 끝은 2047 에서 잘린다. 스로틀 상한 1800 + PID 여유 안에서는 거의 닿지 않음)
 static uint16_t us_to_dshot(int16_t m) {
-	return (m > 1000) ? (uint16_t) (((int32_t) (m - 1000) * 1999) / 1000 + 48) : 48;
+	return (m > 1000) ?
+			(uint16_t) (((int32_t) (m - 1000) * 1999) / 1000 + MOTOR_IDLE_DSHOT) :
+			MOTOR_IDLE_DSHOT;
 }
 
 void motor_mix(uint16_t throttle, float roll_out, float pitch_out,
@@ -281,7 +291,7 @@ void motor_mix(uint16_t throttle, float roll_out, float pitch_out,
 	esc4 = us_to_dshot(m4);
 
 	esc_correction(batteryType); //batteryType:
-	esc_restriction(48, 2047); // DShot300 스케일
+	esc_restriction(MOTOR_IDLE_DSHOT, 2047); // DShot300 스케일, 아밍 중엔 아이들 이하로 내리지 않음
 }
 
 void motor_free(void) {

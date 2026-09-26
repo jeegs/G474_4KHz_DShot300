@@ -6,6 +6,11 @@
  *  - FF 항: RC 프레임 단위 스텝을 1차 LPF 로 평활 (한 샘플 스파이크 제거)
  *  - I항 권한 제한 (PID_I_TERM_MAX)
  *  - alt_PID: 압력 갱신(50Hz)마다만 dt 적용해 계산, 음수 wrap 버그 수정, 단위 Pa
+ *
+ * Revised: 2026-09-26 (Claude)
+ *  - 스로틀이 낮을 때(ATT_I_RESET_THROTTLE 미만: 바닥 대기/이륙 직전) 자세 I항을 0 으로 유지.
+ *    모터 아이들이 생겨 아밍 중에도 PID 가 돌기 때문에, 바닥에서 기울어진 채 I항이 쌓였다가
+ *    이륙 순간 한쪽으로 튀는 것을 막는다.
  */
 
 #include "pid.h"
@@ -20,6 +25,7 @@ PID roll, pitch, yaw, alt;
 #define D_FILTER_ALPHA   0.09f   // D항 LPF (fc ≈ 60Hz)  [기존 0.02 = 13Hz]
 #define FF_FILTER_ALPHA  0.02f   // FF항 LPF (fc ≈ 13Hz)
 #define PID_I_TERM_MAX   150.0f  // I항 최대 출력 권한 (기존 400 = 출력 전체)
+#define ATT_I_RESET_THROTTLE 1100 // 스로틀(ch3)이 이 값 미만이면 자세 I항 누적 안 함 (바닥 대기)
 
 // FF 를 각도 피드백 성분(-angle*17/2.5)까지 미분할지 여부.
 //  0: 스틱 성분만 미분(표준).  1: 기존 방식(사실상 원시 자이로 비례항이 추가됨)
@@ -78,6 +84,11 @@ float real_setpoint(uint16_t sp) {
 }
 
 float att_PID(Which choice, PID *pid, float angle, float angular_velocity, uint16_t sp, float dt) {
+
+	// 바닥 대기/저스로틀: I항만 비운다 (P/D 는 계속 동작해 자세를 잡는다)
+	if (rc.ch3 < ATT_I_RESET_THROTTLE) {
+		pid->integral = 0.0f;
+	}
 
 	if (ARMED != 2) {
 		pid->integral = 0.0f;
