@@ -11,11 +11,13 @@
  *
  *  Revised: 2026-09-26 (Claude)
  *   - altitude = BMP390 기압으로 계산한 상대 고도 [0.1m 단위] (아밍 지점 기준, 음수는 0, 기압계 미준비 시 0)
+ *   - 고도 유지 중(FM2 이상, alt.setpointed)에는 etc1 = 고도 유지 스로틀 [us], etc2 = 목표 고도 [0.1m]
  */
 
 #include "telemetry.h"
 #include "error.h"
 #include "baro.h"
+#include "pid.h"
 
 //Local ---------------------> start:
 extern uint16_t used_clocks;  // main.c (TIM7 0.25us 단위, 1000 초과 = 오버런)
@@ -75,6 +77,11 @@ void telemetry(void) {
 	// 진단용(etc): 루프 사용 클럭, 오버런 횟수
 	tm_tx.etc1 = used_clocks;
 	tm_tx.etc2 = (uint16_t) loop_overrun;
+	if (FM >= 2 && alt.setpointed) {
+		// 고도 유지 튜닝용: 스로틀 [us], 목표 고도 [0.1m] (음수는 0)
+		tm_tx.etc1 = alt_throttle_out;
+		tm_tx.etc2 = (alt.setpoint > 0.0f) ? (uint16_t) (alt.setpoint * 10.0f + 0.5f) : 0;
+	}
 
 	// 상대 고도 [0.1m 단위], 반올림 (예: 12 = 1.2m). uint16 이라 기준점보다 낮으면(음수) 0 으로 보낸다.
 	tm_tx.altitude = 0;
