@@ -20,7 +20,7 @@ typedef struct {
 	uint8_t error; //[0]
 	uint8_t battery; //[1]
 	uint8_t flightMode; //[2], 4bits:FM 2bits:HL 2bits:ARMED
-	uint16_t altitude; //[3][4], 상대 고도 [m] (baro.c, 아밍 지점 기준)
+	uint16_t altitude; //[3][4], 상대 고도 [0.1m 단위] (baro.c, 아밍 지점 기준)
 	uint8_t satNum_fixType; //[5], satellite 5bit(max 31)_fix_type 3bit(max 7)
 	uint8_t fc_speed; //[6]
 	uint8_t waypointNum; //[7]

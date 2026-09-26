@@ -10,7 +10,7 @@
  *   - waypoint 배열 범위 초과 방지
  *
  *  Revised: 2026-09-26 (Claude)
- *   - altitude = BMP390 기압으로 계산한 상대 고도 [m] (아밍 지점 기준, 음수는 0, 기압계 미준비 시 0)
+ *   - altitude = BMP390 기압으로 계산한 상대 고도 [0.1m 단위] (아밍 지점 기준, 음수는 0, 기압계 미준비 시 0)
  */
 
 #include "telemetry.h"
@@ -76,10 +76,10 @@ void telemetry(void) {
 	tm_tx.etc1 = used_clocks;
 	tm_tx.etc2 = (uint16_t) loop_overrun;
 
-	// 상대 고도 [m], 반올림. uint16 이라 기준점보다 낮으면(음수) 0 으로 보낸다.
+	// 상대 고도 [0.1m 단위], 반올림 (예: 12 = 1.2m). uint16 이라 기준점보다 낮으면(음수) 0 으로 보낸다.
 	tm_tx.altitude = 0;
 	if (baro.ready && baro.altitude > 0.0f) {
-		float a = baro.altitude + 0.5f;
+		float a = baro.altitude * 10.0f + 0.5f;
 		tm_tx.altitude = (a > 65535.0f) ? 65535 : (uint16_t) a;
 	}
 
