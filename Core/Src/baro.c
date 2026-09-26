@@ -9,6 +9,15 @@
  *   - 소프트웨어 필터 중첩 제거(하드웨어 IIR 하나만 사용) -> 위상 지연 감소
  *   - 변화율(brake_throttle)을 float(Pa/s)로 변경 (int16 양자화 제거)
  *   - CHIP ID 확인, DRDY 확인 후 읽기, 워밍업(baro.ready), 초기값 0 과도상태 제거
+ *
+ *  Revised: 2026-09-26 (Claude)
+ *   - 동작 확인용 진단값 baro_diag 추가 (CHIP ID, ERR_REG, 설정 레지스터 되읽기, 온도, 압력)
+ *   - CHIP ID 확인을 3회까지 재시도
+ *   - 설정 후 ERR_REG/PWR_CTRL 을 확인해 설정이 실제로 먹지 않았으면 ready 를 올리지 않음
+ *   - 비행 중 센서가 끊겨 새 샘플이 0.2s 이상 안 들어오면 ready=false -> error.BARO
+ *     (기존엔 마지막 값이 그대로 멈춘 채 ready=true 로 남았음)
+ *   - 연결 진단: SPI 속도/모드를 바꿔가며 CHIP ID 를 읽고, 안 되면 MISO 풀다운 시험과
+ *     I2C1(0x76/0x77) 탐색까지 해서 baro_diag 에 남긴다. 통하는 SPI 설정이 있으면 그것을 사용.
  */
 
 #include "baro.h"
@@ -17,6 +26,7 @@
 #include <math.h>
 
 BARO baro;
+BARO_DIAG baro_diag;
 uint32_t baro_counter;
 float brake_throttle;
 
@@ -25,9 +35,11 @@ float brake_throttle;
 #define BARO_POLL_LOOPS      20   // 4kHz/20 = 200Hz 로 DRDY 만 확인 (실제 읽기는 새 샘플이 있을 때만)
 #define BARO_WARMUP_SAMPLES  10   // 0.2s 동안은 ready = false
 #define BARO_RATE_WINDOW     10   // 변화율 계산 창 = 10샘플 = 0.2s
+#define BARO_STALE_LOOPS     800  // 4kHz 기준 0.2s(=10샘플) 동안 새 샘플이 없으면 끊긴 것으로 판단
 
 // --- BMP390L 레지스터 주소 ---
 #define BMP3_CHIP_ID_ADDR       0x00
+#define BMP3_ERR_ADDR           0x02
 #define BMP3_STATUS_ADDR        0x03
 #define BMP3_DATA_ADDR          0x04
 #define BMP3_PWR_CTRL_ADDR      0x1B
@@ -51,6 +63,9 @@ struct bmp3_calib_data {
 };
 static struct bmp3_calib_data calib;
 static bool baro_present = false;
+extern I2C_HandleTypeDef hi2c1;
+static uint32_t fresh_count = 0;   // 끊김 이후 연속으로 받은 정상 샘플 수 (워밍업 판정)
+static uint32_t stale_loops = 0;   // 마지막 정상 샘플 이후 지난 루프 수
 
 // SPI LL 통신 함수 (MS5611과 동일)
 void spi_ll_open() {
@@ -133,12 +148,92 @@ void bmp3_get_calib_data(void) {
 	calib.par_p11 = (double) nvm_p11 / 36893488147419103232.0; // / 2^65
 }
 
+// SPI1 속도/모드 변경 (SPI 를 끈 상태에서만 바꿀 수 있음)
+static void spi1_set(uint32_t prescaler, uint32_t polarity, uint32_t phase) {
+	while (LL_SPI_IsActiveFlag_BSY(SPI1)) {
+	}
+	LL_SPI_Disable(SPI1);
+	LL_SPI_SetBaudRatePrescaler(SPI1, prescaler);
+	LL_SPI_SetClockPolarity(SPI1, polarity);
+	LL_SPI_SetClockPhase(SPI1, phase);
+	LL_SPI_Enable(SPI1);
+}
+
+// 현재 SPI 설정으로 CHIP ID 읽기 (첫 읽기는 더미: CS 하강 에지로 센서를 SPI 모드로 전환)
+static uint8_t spi_probe_id(void) {
+	bmp3_read_reg(BMP3_CHIP_ID_ADDR);
+	LL_mDelay(1);
+	return bmp3_read_reg(BMP3_CHIP_ID_ADDR);
+}
+
+// 속도를 낮춰가며 SPI 로 CHIP ID 를 읽는다. 처음으로 0x60 이 나온 설정을 유지하고 true.
+static bool baro_find_spi(void) {
+	static const struct {
+		uint32_t presc, pol, pha;
+	} cfg[5] = {
+		{ LL_SPI_BAUDRATEPRESCALER_DIV16,  LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 10MHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV32,  LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 5MHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV64,  LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 2.5MHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV256, LL_SPI_POLARITY_LOW,  LL_SPI_PHASE_1EDGE }, // 625kHz
+		{ LL_SPI_BAUDRATEPRESCALER_DIV256, LL_SPI_POLARITY_HIGH, LL_SPI_PHASE_2EDGE }, // 625kHz mode3
+	};
+
+	// SCK/MOSI 에지를 조금 더 가파르게 (생성 코드는 LOW 속도: 10MHz 에서 여유 적음)
+	LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_5, LL_GPIO_SPEED_FREQ_MEDIUM);
+	LL_GPIO_SetPinSpeed(GPIOA, LL_GPIO_PIN_7, LL_GPIO_SPEED_FREQ_MEDIUM);
+
+	baro_diag.probe_ok = 0xFF;
+	for (uint8_t i = 0; i < 5; i++) {
+		spi1_set(cfg[i].presc, cfg[i].pol, cfg[i].pha);
+		baro_diag.probe_id[i] = spi_probe_id();
+		if (baro_diag.probe_id[i] == BMP3_CHIP_ID) {
+			baro_diag.probe_ok = i;
+			return true;
+		}
+	}
+	// 전부 실패: 원래 설정(10MHz mode0)으로 되돌림
+	spi1_set(cfg[0].presc, cfg[0].pol, cfg[0].pha);
+	return false;
+}
+
+// SPI 가 전부 실패했을 때 원인 좁히기: MISO 풀다운 시험, I2C1 주소 탐색
+static void baro_probe_misc(void) {
+	// (a) MISO 에 내부 풀다운을 걸고 읽기. 떠 있는 선이면 0x00, 외부에서 HIGH 로 잡혀 있으면 0xFF.
+	LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_6, LL_GPIO_PULL_DOWN);
+	LL_mDelay(1);
+	spi_ll_open();
+	for (volatile int d = 0; d < 200; d++) {
+	}
+	baro_diag.miso_idle_pd = LL_GPIO_IsInputPinSet(GPIOA, LL_GPIO_PIN_6) ? 1 : 0;
+	spi_ll_close();
+	spi1_set(LL_SPI_BAUDRATEPRESCALER_DIV256, LL_SPI_POLARITY_LOW, LL_SPI_PHASE_1EDGE);
+	baro_diag.id_miso_pd = spi_probe_id();
+	spi1_set(LL_SPI_BAUDRATEPRESCALER_DIV16, LL_SPI_POLARITY_LOW, LL_SPI_PHASE_1EDGE);
+	LL_GPIO_SetPinPull(GPIOA, LL_GPIO_PIN_6, LL_GPIO_PULL_NO);
+
+	// (b) I2C1(PA15=SCL, PB9=SDA) 에 BMP390 이 붙어 있는지 확인 (주소 0x76: SDO=GND, 0x77: SDO=VCC)
+	uint8_t id = 0;
+	baro_diag.i2c_st_76 = (uint8_t) HAL_I2C_Mem_Read(&hi2c1, 0x76 << 1,
+			BMP3_CHIP_ID_ADDR, I2C_MEMADD_SIZE_8BIT, &id, 1, 5);
+	baro_diag.i2c_id_76 = (baro_diag.i2c_st_76 == HAL_OK) ? id : 0;
+	id = 0;
+	baro_diag.i2c_st_77 = (uint8_t) HAL_I2C_Mem_Read(&hi2c1, 0x77 << 1,
+			BMP3_CHIP_ID_ADDR, I2C_MEMADD_SIZE_8BIT, &id, 1, 5);
+	baro_diag.i2c_id_77 = (baro_diag.i2c_st_77 == HAL_OK) ? id : 0;
+}
+
 void baro_init(Sensor type) {
 	baro.ready = false;
 	baro.sample_count = 0;
 	baro_present = false;
 
 	spi_ll_close(); // CS HIGH
+
+	// 0. 통하는 SPI 설정 찾기 (배선/속도 문제 진단 겸용). 찾은 설정을 그대로 사용한다.
+	if (!baro_find_spi()) {
+		baro_probe_misc(); // SPI 전부 실패 -> MISO 풀다운 시험 + I2C 탐색 결과만 남기고 종료
+		return;
+	}
 
 	// 1. Soft Reset
 	bmp3_write_reg(BMP3_CMD_ADDR, 0xB6);
@@ -148,8 +243,14 @@ void baro_init(Sensor type) {
 	bmp3_read_reg(BMP3_CHIP_ID_ADDR);
 	dshot_delay_ms(10);
 
-	// 3. CHIP ID 확인 (BMP390 = 0x60). 다르면 baro.ready 는 false 로 남는다.
-	if (bmp3_read_reg(BMP3_CHIP_ID_ADDR) != BMP3_CHIP_ID) {
+	// 3. CHIP ID 확인 (BMP390 = 0x60). 3회 모두 다르면 baro.ready 는 false 로 남는다.
+	for (int i = 0; i < 3; i++) {
+		baro_diag.chip_id = bmp3_read_reg(BMP3_CHIP_ID_ADDR);
+		if (baro_diag.chip_id == BMP3_CHIP_ID)
+			break;
+		dshot_delay_ms(10);
+	}
+	if (baro_diag.chip_id != BMP3_CHIP_ID) {
 		return;
 	}
 
@@ -171,6 +272,16 @@ void baro_init(Sensor type) {
 	bmp3_write_reg(BMP3_PWR_CTRL_ADDR, 0x33);
 
 	dshot_delay_ms(30); // 첫 변환 대기
+
+	// 6. 설정 되읽기. 잘못된 OSR/ODR 조합이면 conf_err 가 서고 센서가 Normal 모드로 들어가지 않는다.
+	baro_diag.err_reg = bmp3_read_reg(BMP3_ERR_ADDR);
+	baro_diag.pwr_ctrl = bmp3_read_reg(BMP3_PWR_CTRL_ADDR);
+	baro_diag.osr = bmp3_read_reg(BMP3_OSR_ADDR);
+	baro_diag.odr = bmp3_read_reg(BMP3_ODR_ADDR);
+	baro_diag.config = bmp3_read_reg(BMP3_CONFIG_ADDR);
+	if ((baro_diag.err_reg & 0x07) != 0 || (baro_diag.pwr_ctrl & 0x33) != 0x33) {
+		return;
+	}
 
 	baro_present = true;
 }
@@ -233,7 +344,19 @@ static float brake_rate(double press_pa) {
 float get_pressure(Sensor type) {
 
 	// 메인루프(4kHz) 20회마다 DRDY 만 확인하고, 새 샘플이 있을 때만 읽는다 (센서 ODR 50Hz 에 동기)
-	if (baro_present && (baro_counter++ % BARO_POLL_LOOPS) == 0) {
+	if (!baro_present)
+		return baro.press_compensated;
+
+	// 끊김 감지: 새 샘플이 0.2s 넘게 안 들어오면 ready 를 내린다 (다시 들어오면 워밍업 후 복구)
+	if (++stale_loops > BARO_STALE_LOOPS) {
+		stale_loops = 0;
+		fresh_count = 0;
+		if (baro.ready)
+			baro_diag.stale_count++;
+		baro.ready = false;
+	}
+
+	if ((baro_counter++ % BARO_POLL_LOOPS) == 0) {
 
 		if ((bmp3_read_reg(BMP3_STATUS_ADDR) & BMP3_STATUS_DRDY_MASK)
 				== BMP3_STATUS_DRDY_MASK) {
@@ -250,6 +373,8 @@ float get_pressure(Sensor type) {
 
 			bmp3_compensate_temp(uncomp_t);
 			double press_pa = bmp3_compensate_press(uncomp_p);
+			baro_diag.temp_c_x100 = (int32_t) (t_lin * 100.0);
+			baro_diag.press_pa_x100 = (int32_t) (press_pa * 100.0);
 
 			// 범위 밖(리셋 직후 0x800000 등) 값은 버린다
 			if (press_pa > BMP3_PRESS_MIN_PA && press_pa < BMP3_PRESS_MAX_PA) {
@@ -261,9 +386,13 @@ float get_pressure(Sensor type) {
 				brake_throttle = brake_rate(press_pa);
 
 				baro.sample_count++;
-				if (baro.sample_count >= BARO_WARMUP_SAMPLES) {
+				stale_loops = 0;
+				if (++fresh_count >= BARO_WARMUP_SAMPLES) {
+					fresh_count = BARO_WARMUP_SAMPLES;
 					baro.ready = true;
 				}
+			} else {
+				baro_diag.reject_count++;
 			}
 		}
 	}

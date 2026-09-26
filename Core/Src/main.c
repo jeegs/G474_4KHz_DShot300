@@ -65,6 +65,12 @@
 // 2026-09-25 11:20: 진짜 원인(rc.c의 rc_ever_valid 미갱신 버그) 확인 및 수정
 // 완료로 0으로 되돌림. printf 는 매 호출 블로킹이라 상시 켜두면 안 됨.
 #define RC_DEBUG_PRINT    0
+// 1: BMP390L 동작 확인용 출력(USART2, 2,000,000bps 8N1, 4Hz, 디스암 상태에서만).
+// printf 가 블로킹이라 출력하는 루프는 오버런(etc2 증가)이 난다. 확인 후 0 으로.
+#define BARO_DEBUG_PRINT  0
+#if BARO_DEBUG_PRINT && !BARO_ENABLED
+#error "BARO_DEBUG_PRINT requires BARO_ENABLED"
+#endif
 #if ALT_HOLD_ENABLED && !BARO_ENABLED
 #error "ALT_HOLD_ENABLED requires BARO_ENABLED"
 #endif
@@ -84,6 +90,7 @@ I2C_HandleTypeDef hi2c1;
 uint16_t loop_start;
 uint16_t used_clocks;
 uint16_t used_clocks_max; // 관측된 최대 루프 사용 클럭 (0.25us 단위, FC_LOOP_CLOCKS 이상 = 오버런)
+uint16_t baro_clocks_max; // get_pressure() 1회 최대 소요 클럭 (0.25us 단위). 50Hz 로 읽는 루프의 부담 확인용
 uint32_t loop_overrun;    // 250us 를 넘긴 루프 횟수
 uint32_t loop_counter; //제어 루프(4kHz) 카운터: 0.25ms 단위
 
@@ -370,7 +377,11 @@ int main(void)
 
 		// BMP390L [hPa]
 #if BARO_ENABLED
+		uint16_t baro_t0 = LL_TIM_GetCounter(TIM7);
 		float pressure = get_pressure(bmp390L);
+		uint16_t baro_used = (uint16_t) (LL_TIM_GetCounter(TIM7) - baro_t0);
+		if (baro_used < FC_LOOP_CLOCKS && baro_used > baro_clocks_max)
+			baro_clocks_max = baro_used;
 #else
 		float pressure = 0;
 #endif
@@ -390,6 +401,27 @@ int main(void)
 			printf("RC f=%lu v=%lu c1=%u c2=%u c3=%u c4=%u c5=%u armed=%u eRC=%u\r\n",
 					(unsigned long) rc_frames_total, (unsigned long) rc_frames_valid,
 					rc.ch1, rc.ch2, rc.ch3, rc.ch4, rc.ch5, ARMED, error.RC);
+		}
+#endif
+
+#if BARO_DEBUG_PRINT
+		// 진단용(임시, 4Hz, 디스암 시에만): BMP390L 상태 출력
+		// id=0x60, err=0x00, pwr=0x33, osr=0x03, odr=0x02, cfg=0x04 이어야 정상.
+		// P=압력[Pa], T=칩온도[degC], n=누적 샘플(초당 50씩 증가), rdy=baro.ready
+		if (ARMED != 2 && loop_counter % 1000 == 0) {
+			// baro_clk: get_pressure() 최대 소요 [0.25us 단위]
+			int32_t p = baro_diag.press_pa_x100, t = baro_diag.temp_c_x100;
+			int32_t ta = (t < 0) ? -t : t;
+			printf("BARO id=%02X err=%02X pwr=%02X osr=%02X odr=%02X cfg=%02X "
+					"P=%ld.%02ld T=%s%ld.%02ld n=%lu rej=%lu stale=%lu rdy=%u baro_clk=%u\r\n",
+					baro_diag.chip_id, baro_diag.err_reg, baro_diag.pwr_ctrl,
+					baro_diag.osr, baro_diag.odr, baro_diag.config,
+					(long) (p / 100), (long) (p % 100),
+					(t < 0) ? "-" : "", (long) (ta / 100), (long) (ta % 100),
+					(unsigned long) baro.sample_count,
+					(unsigned long) baro_diag.reject_count,
+					(unsigned long) baro_diag.stale_count, baro.ready,
+					baro_clocks_max);
 		}
 #endif
 
