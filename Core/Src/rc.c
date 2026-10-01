@@ -117,6 +117,15 @@
  *   - 페일세이프 상태 진단값 rc_fs 추가 (active/rising/lost/pattern/airborne/throttle/start_count)
  *   - iBus 채널값 상위 4비트 제거(& 0x0FFF). 송신기를 끄면 수신기가 ch5/ch6 을 0xF3E8(62440)로
  *     보내 FM2 이상(고도 유지)으로 넘어갔고, 이것이 지그 페일세이프 시험의 증감 반복 원인이었음.
+ *
+ *  Revised: 2026-10-01 (Claude)
+ *   - 시뮬레이터 비행 중 스틱을 놓고 있는데 롤로 약 30도씩 규칙적으로 튕기던 현상이 수신기 교체로
+ *     사라짐 -> 수신기가 체크섬은 맞지만 값이 잘못된 프레임을 보낸 것으로 판단. get_rc() 에 방어 추가:
+ *     (1) 범위 검사: ch1~ch6 중 하나라도 RC_VALID_MIN~MAX 를 벗어나면 그 프레임 전체를 버림
+ *     (2) 한 프레임 튐 무시: ch1~ch6 이 직전 값에서 RC_SPIKE_US 넘게 한 번에 바뀌면 그 프레임은
+ *         그 채널만 직전 값을 유지하고, 다음 프레임에서도 크게 다르면 그때 받아들인다(약 7ms 지연).
+ *         한 프레임만 튀었다가 돌아오면 무시된다. 송신기 끔(페일세이프 값) 같은 지속 변화는 7ms 늦게 반영.
+ *     진단: rc_frames_rejected(범위 밖으로 버린 프레임), rc_spike_count(튐으로 보류한 횟수)
  */
 
 #include "rc.h"
@@ -178,6 +187,14 @@ uint16_t uart4_rx_checksum;
 uint32_t rc_frames_total;
 uint32_t rc_frames_valid;
 
+// 수신기 이상값 방어 (2026-10-01)
+#define RC_VALID_MIN   800   // ch1~ch6 정상 범위 (FS-i6 끝점 120% 여유 포함)
+#define RC_VALID_MAX   2200
+#define RC_SPIKE_US    300   // 한 프레임(약 7ms)에 이보다 크게 바뀌면 한 프레임 보류
+#define RC_GUARD_CH    6     // 범위 검사/튐 무시를 적용할 채널 수 (ch1~ch6)
+uint32_t rc_frames_rejected; // 범위 밖이라 통째로 버린 프레임 수 (0 이어야 정상)
+uint32_t rc_spike_count;     // 튐으로 한 프레임 보류한 횟수 (스틱/스위치를 아주 빠르게 칠 때 조금 늘 수 있음)
+
 RC get_rc(Sensor type) {
 
 	if (uart4_rx_idle) {
@@ -196,19 +213,45 @@ RC get_rc(Sensor type) {
 			rc_frames_valid++;
 			// iBus 채널값은 하위 12비트만 유효. 상위 4비트는 확장 채널 등 다른 용도라 버린다.
 			// (송신기를 끄면 FS-iA6B 가 ch5/ch6 을 0xF3E8 = 62440 으로 보내 FM2 이상으로 넘어가던 문제)
-			channel.ch1 = uart4_rx_data[0] | (uart4_rx_data[1] & 0x0F) << 8;
-			channel.ch2 = uart4_rx_data[2] | (uart4_rx_data[3] & 0x0F) << 8;
-			channel.ch3 = uart4_rx_data[4] | (uart4_rx_data[5] & 0x0F) << 8;
-			channel.ch4 = uart4_rx_data[6] | (uart4_rx_data[7] & 0x0F) << 8;
-			channel.ch5 = uart4_rx_data[8] | (uart4_rx_data[9] & 0x0F) << 8;
-			channel.ch6 = uart4_rx_data[10] | (uart4_rx_data[11] & 0x0F) << 8;
-			channel.ch7 = uart4_rx_data[12] | (uart4_rx_data[13] & 0x0F) << 8;
-			channel.ch8 = uart4_rx_data[14] | (uart4_rx_data[15] & 0x0F) << 8;
-			channel.ch9 = uart4_rx_data[16] | (uart4_rx_data[17] & 0x0F) << 8;
-			channel.ch10 = uart4_rx_data[18] | (uart4_rx_data[19] & 0x0F) << 8;
+			uint16_t v[10];
+			for (uint8_t i = 0; i < 10; i++)
+				v[i] = uart4_rx_data[i * 2] | (uart4_rx_data[i * 2 + 1] & 0x0F) << 8;
 
-			rc_last_valid_ms = HAL_GetTick();
-			rc_ever_valid = true;
+			// (1) 범위 검사: 하나라도 벗어나면 프레임 전체를 버린다(직전 값 유지).
+			//     버린 프레임은 rc_last_valid_ms 를 갱신하지 않으므로, 계속 이상하면 링크 두절로 처리된다.
+			bool in_range = true;
+			for (uint8_t i = 0; i < RC_GUARD_CH; i++) {
+				if (v[i] < RC_VALID_MIN || v[i] > RC_VALID_MAX)
+					in_range = false;
+			}
+
+			if (!in_range) {
+				rc_frames_rejected++;
+			} else {
+				// (2) 한 프레임 튐 무시 (ch1~ch6). 첫 유효 프레임은 그대로 받는다.
+				static bool held[RC_GUARD_CH];
+				uint16_t *const cur[RC_GUARD_CH] = { &channel.ch1, &channel.ch2, &channel.ch3,
+						&channel.ch4, &channel.ch5, &channel.ch6 };
+				for (uint8_t i = 0; i < RC_GUARD_CH; i++) {
+					int32_t d = (int32_t) v[i] - (int32_t) *cur[i];
+					if (d < 0)
+						d = -d;
+					if (rc_ever_valid && d > RC_SPIKE_US && !held[i]) {
+						held[i] = true; // 이번 프레임은 직전 값 유지
+						rc_spike_count++;
+					} else {
+						held[i] = false;
+						*cur[i] = v[i];
+					}
+				}
+				channel.ch7 = v[6];
+				channel.ch8 = v[7];
+				channel.ch9 = v[8];
+				channel.ch10 = v[9];
+
+				rc_last_valid_ms = HAL_GetTick();
+				rc_ever_valid = true;
+			}
 		}
 
 		LL_USART_EnableIT_RXNE(UART4);

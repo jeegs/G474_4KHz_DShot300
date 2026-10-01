@@ -29,6 +29,8 @@ extern RC rc;
 
 extern uint32_t rc_frames_total; // 진단용(임시): iBus 프레임 시도 횟수
 extern uint32_t rc_frames_valid; // 진단용(임시): 체크섬 통과(유효) 횟수
+extern uint32_t rc_frames_rejected; // 채널값이 범위 밖이라 버린 프레임 수 (0 이어야 정상)
+extern uint32_t rc_spike_count;     // 한 프레임 튐으로 보류한 횟수
 
 RC get_rc(Sensor type);
 bool rc_link_lost(void);   // 유효 프레임이 RC_TIMEOUT_MS 이상 없으면 true
