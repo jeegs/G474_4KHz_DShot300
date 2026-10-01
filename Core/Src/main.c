@@ -409,6 +409,7 @@ int main(void)
 		//set FLIGHT MODE and ARMING -------------------------------------------------> 2)
 		FM = flightmode(rc);
 		ARMED = arming(rc);
+		pid_tune_update(); // 튜닝 모드(pid.h PID_TUNE_MODE): ch5=P/I/D 선택, ch9=배율
 #if BARO_ENABLED
 		// 아밍되는 순간의 압력을 상대 고도 0m 로 잡는다 (텔레메트리 altitude 기준)
 		static uint8_t prev_armed = 0;

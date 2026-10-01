@@ -82,6 +82,12 @@ void telemetry(void) {
 		tm_tx.etc1 = alt_throttle_out;
 		tm_tx.etc2 = (alt.setpoint > 0.0f) ? (uint16_t) (alt.setpoint * 10.0f + 0.5f) : 0;
 	}
+#if PID_TUNE_MODE
+	// 튜닝 모드: etc1 = 0x8000 | caught<<10 | sel<<8 | P%,  etc2 = I%<<8 | D%  (앱이 "P100 I100 D100" 으로 표시)
+	tm_tx.etc1 = (uint16_t) (0x8000 | ((pid_tune.caught ? 1 : 0) << 10)
+			| ((pid_tune.sel & 0x03) << 8) | pid_tune.p_pct);
+	tm_tx.etc2 = (uint16_t) ((pid_tune.i_pct << 8) | pid_tune.d_pct);
+#endif
 
 	// 상대 고도 [0.1m 단위], 반올림 (예: 12 = 1.2m). uint16 이라 기준점보다 낮으면(음수) 0 으로 보낸다.
 	tm_tx.altitude = 0;

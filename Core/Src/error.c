@@ -70,16 +70,20 @@ bool err_checker(Sensor name) {
 			else if (rc.ch3 > 1010 || rc.ch3 < 990) { // 1010!!!
 				return true;
 			}
+#if !PID_TUNE_MODE // 튜닝 모드: ch5(P/I/D 선택), ch9(배율 다이얼)는 아밍 전 위치 검사 안 함
 			else if (rc.ch5 > 1002)
 				return true;
+#endif
 			else if (rc.ch6 > 1002)
 				return true;
 			else if (rc.ch7 > 1002)
 				return true;
 			else if (rc.ch8 > 1002)
 				return true;
+#if !PID_TUNE_MODE
 			else if (rc.ch9 > 1100)
 				return true;
+#endif
 			else if (rc.ch10 > 1100) {
 				//return true;//Not used for debugging: (   )
 			}

@@ -274,6 +274,11 @@ uint8_t flightmode(RC _rc) {
 	if (rc_fs.active)
 		return 1;
 
+#if PID_TUNE_MODE
+	// 튜닝 모드: ch5 는 P/I/D 선택용이라 비행 모드로 쓰지 않는다 (고도 유지 꺼짐)
+	return 1;
+#endif
+
 	if (ARMED == 2) {
 		if (_rc.ch5 > 1400 && !error.BARO) {
 			fm = 2;

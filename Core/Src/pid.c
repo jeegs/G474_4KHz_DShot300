@@ -14,6 +14,9 @@
  *  - alt_PID 를 고도[m] 기준으로 변경 (baro.altitude). 기존 Pa 게인을 1m = 12Pa 로 환산해 유지
  *    (Kp 1.5 -> 18, Ki 0.5 -> 6, Kd 4.0 -> 48). 스로틀 1200 미만에서는 고도 유지에 들어가지 않음.
  *    D 입력 기본값을 0.2s 창 상승률(잡음이 작음)로 변경, ch10 > 1100 이면 기존 샘플 단위 필터 방식.
+ *
+ * Revised: 2026-10-01 (Claude)
+ *  - 튜닝 모드(pid.h PID_TUNE_MODE): ch5 로 P/I/D 선택, ch9 다이얼로 롤·피치 게인 배율 50~150% 조정.
  */
 
 #include "pid.h"
@@ -21,6 +24,46 @@
 #include "baro.h"
 
 PID roll, pitch, yaw, alt;
+PID_TUNE pid_tune = { 0, 100, 100, 100, false }; // sel=0: 첫 호출에서 스위치 위치를 읽는다
+
+#define TUNE_PCT_MIN  50
+#define TUNE_PCT_MAX  150
+#define TUNE_PCT_STEP 5
+
+void pid_tune_update(void) {
+#if PID_TUNE_MODE
+	static int32_t prev_knob = 0;
+
+	// ch5 3단 스위치: ~1000 -> P, ~1500 -> I, ~2000 -> D
+	uint8_t sel = (rc.ch5 < 1250) ? 1 : (rc.ch5 < 1750) ? 2 : 3;
+
+	// ch9 다이얼 1000~2000 -> 50~150% (5% 단위로 반올림)
+	int32_t knob = ((int32_t) rc.ch9 - 1000) / 10 + TUNE_PCT_MIN;
+	knob = ((knob + TUNE_PCT_STEP / 2) / TUNE_PCT_STEP) * TUNE_PCT_STEP;
+	if (knob < TUNE_PCT_MIN)
+		knob = TUNE_PCT_MIN;
+	if (knob > TUNE_PCT_MAX)
+		knob = TUNE_PCT_MAX;
+
+	uint8_t *target = (sel == 1) ? &pid_tune.p_pct :
+						(sel == 2) ? &pid_tune.i_pct : &pid_tune.d_pct;
+
+	if (sel != pid_tune.sel) {
+		pid_tune.sel = sel;
+		pid_tune.caught = false;
+		prev_knob = knob;
+	}
+
+	// 다이얼이 현재 배율과 같아지거나 그 위치를 지나가면 그때부터 따라간다
+	if (!pid_tune.caught) {
+		if ((prev_knob - *target) * (knob - *target) <= 0)
+			pid_tune.caught = true;
+		prev_knob = knob;
+	}
+	if (pid_tune.caught)
+		*target = (uint8_t) knob;
+#endif
+}
 
 // ---- 자세 PID 필터/제한 상수 (제어 루프 4kHz, dt=0.00025s) ----
 // 1차 LPF: α = 1 - exp(-2π·fc·dt)
@@ -133,9 +176,19 @@ float att_PID(Which choice, PID *pid, float angle, float angular_velocity, uint1
 		pid->integral += error * dt;
 	}
 
+	// 이번 계산에 쓸 게인 (튜닝 모드면 롤·피치에 다이얼 배율 적용)
+	float kp = pid->Kp, ki = pid->Ki, kd = pid->Kd;
+#if PID_TUNE_MODE
+	if (choice != YAW) {
+		kp *= pid_tune.p_pct * 0.01f;
+		ki *= pid_tune.i_pct * 0.01f;
+		kd *= pid_tune.d_pct * 0.01f;
+	}
+#endif
+
 	// I항 권한 제한: Ki*integral <= PID_I_TERM_MAX
-	if (pid->Ki > 0.0000001f) {
-		float i_limit = PID_I_TERM_MAX / pid->Ki;
+	if (ki > 0.0000001f) {
+		float i_limit = PID_I_TERM_MAX / ki;
 		pid->integral = restrict_max(pid->integral, i_limit);
 	}
 
@@ -158,9 +211,9 @@ float att_PID(Which choice, PID *pid, float angle, float angular_velocity, uint1
 	pid->prev_error = error;
 
 	// 최종 PID + FF 출력 병합
-	pid->output = (pid->Kp * error) +
-	              (pid->Ki * pid->integral) +
-	              (pid->Kd * pid->filtered_derivative) +
+	pid->output = (kp * error) +
+	              (ki * pid->integral) +
+	              (kd * pid->filtered_derivative) +
 	              ff_term;
 
 	return restrict_max(pid->output, 400);
