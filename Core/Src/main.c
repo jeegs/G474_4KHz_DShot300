@@ -287,12 +287,10 @@ static uint16_t us_to_dshot(int16_t m) {
 void motor_mix(uint16_t throttle, float roll_out, float pitch_out,
 		float yaw_out) {
 
-	// 2026-10-01: 4모터 첫 비행에서 피치 보정이 반대로 확인되어 피치 부호를 뒤집음
-	// (이전: m1,m4 = +pitch / m2,m3 = -pitch)
-	int16_t m1 = throttle - roll_out - (pitch_out * 0.72f) + yaw_out;
-	int16_t m2 = throttle - roll_out + (pitch_out * 0.72f) - yaw_out;
-	int16_t m3 = throttle + roll_out + (pitch_out * 0.72f) + yaw_out;
-	int16_t m4 = throttle + roll_out - (pitch_out * 0.72f) - yaw_out;
+	int16_t m1 = throttle - roll_out + (pitch_out * 0.72f) + yaw_out;
+	int16_t m2 = throttle - roll_out - (pitch_out * 0.72f) - yaw_out;
+	int16_t m3 = throttle + roll_out - (pitch_out * 0.72f) + yaw_out;
+	int16_t m4 = throttle + roll_out + (pitch_out * 0.72f) - yaw_out;
 
 	esc1 = us_to_dshot(m1);
 	esc2 = us_to_dshot(m2);
